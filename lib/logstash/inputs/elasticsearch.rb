@@ -2,7 +2,7 @@
 require "logstash/inputs/base"
 require "logstash/namespace"
 require "base64"
-
+require "json"
 # .Compatibility Note
 # [NOTE]
 # ================================================================================
@@ -76,8 +76,8 @@ class LogStash::Inputs::Elasticsearch < LogStash::Inputs::Base
   config :query, :validate => :string, :default => '{ "sort": [ "_doc" ] }'
 
   # This allows you to speccify the response type: either hits or aggregations
-  config :response_type, :validate => ['hits', 'aggregations'], :default => 'hits'
-
+  config :response_type, :validate => ['hits', 'aggregations', 'composite'], :default => 'hits'
+  
   # This allows you to set the maximum number of hits returned per scroll.
   config :size, :validate => :number, :default => 1000
 
@@ -180,6 +180,10 @@ class LogStash::Inputs::Elasticsearch < LogStash::Inputs::Base
       transport_options[:ssl] = { :ca_file => @ca_file }
     end
 
+    @queryObject = JSON.parse(@query)
+    @aggName = 'aggs'
+    @bucketName = '__buckets'
+    @bucket = 'mrId'
     @client = Elasticsearch::Client.new(:hosts => hosts, :transport_options => transport_options)
   end
 
@@ -217,9 +221,33 @@ class LogStash::Inputs::Elasticsearch < LogStash::Inputs::Base
         end
       when 'aggregations'
           push_aggregation(r, output_queue)
+      when 'composite'
+          push_aggregation(r, output_queue)
+          afterKey = get_after_key(r)
+          @logger.info("AFTER_KEY: #{afterKey}")
+          while !(afterKey.nil?) do
+            tmpObj = {}
+            tmpObj[@bucket] = afterKey
+            @queryObject[@aggName][@bucketName]['composite']['after'] = tmpObj
+            @options = {
+              :index => @index,
+              :body => @queryObject.to_json,
+              :size => 0
+            }
+            r = @client.search(@options)
+            push_aggregation(r, output_queue)
+            afterKey = get_after_key(r)
+            @logger.info("AFTER_KEY: #{afterKey}")
+          end
     end
-
   end
+
+  def get_after_key(r)
+    if !(r['aggregations'][@bucketName]['after_key'].nil?)
+      return r['aggregations'][@bucketName]['after_key'][@bucket]
+    end
+    return nil
+  end 
 
   def process_next_scroll(output_queue, scroll_id)
     r = scroll_request(scroll_id)
