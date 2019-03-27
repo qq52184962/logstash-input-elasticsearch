@@ -199,46 +199,98 @@ class LogStash::Inputs::Elasticsearch < LogStash::Inputs::Base
     else
       do_run(output_queue)
     end
+    rescue LogStash::ShutdownSignal
+      @logger.info("Bye~")
   end
 
   def stop
-    @scheduler.stop if @scheduler
+    @scheduler.shutdown(:kill => 9) if @scheduler
   end
 
   private
-
   def do_run(output_queue)
-    # get first wave of data
-    r = @client.search(@options)
-    case @response_type
-      when 'hits'
-        r['hits']['hits'].each { |hit| push_hit(hit, output_queue) }
-        has_hits = r['hits']['hits'].any?
+    if @response_type == 'composite' then
 
-        while has_hits && !stop?
-          r = process_next_scroll(output_queue, r['_scroll_id'])
-          has_hits = r['has_hits']
-        end
-      when 'aggregations'
-          push_aggregation(r, output_queue)
-      when 'composite'
-          push_aggregation(r, output_queue)
-          afterKey = get_after_key(r)
-          @logger.info("AFTER_KEY: #{afterKey}")
-          while !(afterKey.nil?) do
-            tmpObj = {}
-            tmpObj[@bucket] = afterKey
-            @queryObject[@aggName][@bucketName]['composite']['after'] = tmpObj
-            @options = {
-              :index => @index,
-              :body => @queryObject.to_json,
-              :size => 0
+      @logger.info("TRYING TO GET AFTER_KEY FROM #{ENV['ES_INDEX']}")
+      exists = @client.indices.exists(:index => ENV['ES_INDEX'])
+      if !exists then
+        @logger.info("AFTER_KEY NOT FOUND, STOP LOGSTASH")
+        stop()
+        exit
+        return
+      end
+
+      # get current after key
+      @logger.info("GETTING AFTER_KEY...")
+      r = @client.search({
+        :index => ENV['ES_INDEX'],
+        :body => '{
+          "query": {
+              "match_all": {}
             }
-            r = @client.search(@options)
-            push_aggregation(r, output_queue)
-            afterKey = get_after_key(r)
-            @logger.info("AFTER_KEY: #{afterKey}")
+          }',
+        :size => 1
+      })
+      if r['hits']['total'] > 0 then
+        @logger.info("AFTER_KEY = #{r['hits']['hits'][0]['_source']['after']}")
+
+        tmpObj = {}
+        tmpObj[@bucket] = r['hits']['hits'][0]['_source']['after']
+        @queryObject[@aggName][@bucketName]['composite']['after'] = tmpObj
+        @options = {
+          :index => @index,
+          :body => @queryObject.to_json,
+          :size => 0
+        }
+      elsif
+        @logger.info("AFTER_KEY NOT FOUND")
+      end
+
+      # search
+      @logger.info("RETRIEVING DATA...")
+      r = @client.search(@options)
+      push_aggregation(r, output_queue)
+      afterKey = get_after_key(r)
+
+      if afterKey.nil? then
+        @logger.info("NO AFTER_KEY FOUND. DELETING #{ENV['ES_INDEX']}")
+        @client.indices.delete(:index => ENV['ES_INDEX'])
+        @logger.info("STOPPING LOGSTASH")
+        stop()
+        exit
+      elsif
+        @logger.info("UPDATING AFTER_KEY...")
+        @client.update(
+          :index => ENV['ES_INDEX'], 
+          :type => "_doc",
+          :id => 1,
+          :body => { 
+            :script => { 
+              :source => 'ctx._source.after = params.val', 
+              :params => { 
+                :val => afterKey 
+              } 
+            },
+            :upsert => {
+              "after": afterKey
+            } 
+          }
+        )
+      end    
+    elsif
+      r = @client.search(@options)
+      case @response_type
+        when 'hits'
+          r['hits']['hits'].each { |hit| push_hit(hit, output_queue) }
+          has_hits = r['hits']['hits'].any?
+
+          while has_hits && !stop?
+            r = process_next_scroll(output_queue, r['_scroll_id'])
+            has_hits = r['has_hits']
           end
+        when 'aggregations'
+            push_aggregation(r, output_queue)            
+      end
     end
   end
 
