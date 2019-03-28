@@ -184,17 +184,17 @@ class LogStash::Inputs::Elasticsearch < LogStash::Inputs::Base
     @aggName = 'aggs'
     @bucketName = '__buckets'
     @bucket = 'mrId'
+    @thread = nil
     @client = Elasticsearch::Client.new(:hosts => hosts, :transport_options => transport_options)
   end
 
 
   def run(output_queue)
     if @schedule
-      @scheduler = Rufus::Scheduler.new(:max_work_threads => 1)
-      @scheduler.cron @schedule do
+      @scheduler = Rufus::Scheduler.new(:max_work_threads => 1, :frequency => '5s')
+      @scheduler.every '5s' do
         do_run(output_queue)
       end
-
       @scheduler.join
     else
       do_run(output_queue)
@@ -204,7 +204,8 @@ class LogStash::Inputs::Elasticsearch < LogStash::Inputs::Base
   end
 
   def stop
-    @scheduler.shutdown(:kill => 9) if @scheduler
+    @thread.exit if @thread
+    # @scheduler.shutdown(:kill => 9) if @scheduler
   end
 
   private
@@ -249,6 +250,12 @@ class LogStash::Inputs::Elasticsearch < LogStash::Inputs::Base
       # search
       @logger.info("RETRIEVING DATA...")
       r = @client.search(@options)
+      if !r['aggregations'][@bucketName]['buckets'].nil? then
+        @logger.info("PUSH #{r['aggregations'][@bucketName]['buckets'].length} buckets into queue")
+        if r['aggregations'][@bucketName]['buckets'].length > 0 then 
+          @logger.info("KEY = #{r['aggregations'][@bucketName]['buckets'][0]['key'][@mrId]}")
+        end
+      end
       push_aggregation(r, output_queue)
       afterKey = get_after_key(r)
 
